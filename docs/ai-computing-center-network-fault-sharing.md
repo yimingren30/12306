@@ -1442,6 +1442,134 @@ flowchart TD
 | NCCL | AllReduce latency、timeout、retry |
 | 训练任务 | step time、GPU util、MFU |
 
+#### 排查步骤与命令
+
+> 说明：交换机命令会因厂商不同而不同，下面用通用写法表示。实际落地时需要替换为本厂商 CLI，例如 `show interface ...`、`display interface ...`、`net show interface ...` 等。
+
+1. **先从训练日志定位慢 rank 和异常时间段**
+
+   ```bash
+   # 查看 NCCL / 通信相关日志
+   rg -n "NCCL|AllReduce|AllGather|timeout|NET/IB|WARN|ERROR|rank" /path/to/train.log
+
+   # 如果日志很多，先按异常时间窗口过滤
+   rg -n "2026-05-11 09:|timeout|rank 327|NET/IB" /path/to/train.log
+   ```
+
+   要确认：
+
+   ```text
+   哪个 rank 最先报错或最慢
+   异常是否集中在固定 rank
+   异常发生时间是否与 step time 尖刺一致
+   ```
+
+2. **建立 rank 到主机、GPU、网卡的映射**
+
+   ```bash
+   # 在训练进程所在容器或节点内查看 rank 相关环境变量
+   env | sort | rg "RANK|WORLD_SIZE|LOCAL_RANK|MASTER|NCCL"
+
+   # Kubernetes 场景：查看 pod 落在哪台节点
+   kubectl get pod -n <namespace> -o wide | rg "<job-name>|<pod-name>"
+
+   # Slurm 场景：查看任务节点分配
+   scontrol show job <job_id>
+   scontrol show hostnames <nodelist>
+   ```
+
+   目标是得到：
+
+   ```text
+   rank 327 => gpu-node-041 => GPU 7 => mlx5_1 / ensXfY => switch port Ethernet1/17
+   ```
+
+3. **在异常主机上检查网卡和链路状态**
+
+   ```bash
+   # 查看网卡基础状态和速率
+   ip -br link
+   ethtool <nic>
+
+   # 查看网卡错误计数
+   ethtool -S <nic> | rg -i "err|crc|drop|discard|timeout|reset|pause|fec|symbol"
+
+   # 连续观察错误计数是否增长
+   watch -n 5 'ethtool -S <nic> | egrep -i "err|crc|drop|discard|pause|fec|symbol"'
+   ```
+
+   重点看：
+
+   ```text
+   rx_errors / tx_errors 是否增长
+   crc / symbol error 是否增长
+   link speed 是否低于预期
+   pause frame 是否异常增长
+   ```
+
+4. **检查 IB / RDMA 设备状态**
+
+   ```bash
+   # IB / RDMA 设备和端口状态
+   ibstat
+   ibv_devinfo
+   rdma link
+
+   # 网卡到 RDMA 设备映射，常见于 Mellanox / NVIDIA 网卡
+   ibdev2netdev -v
+
+   # IB 环境可查看端口性能计数器
+   perfquery
+   ```
+
+   重点看：
+
+   ```text
+   State 是否 Active
+   Physical state 是否 LinkUp
+   Rate 是否符合预期
+   SymbolErrorCounter、LinkErrorRecoveryCounter、VL15Dropped 是否异常
+   ```
+
+5. **在交换机侧检查对应端口**
+
+   ```text
+   show interface ethernet <port>
+   show interface ethernet <port> counters errors
+   show interface ethernet <port> transceiver
+   show interface ethernet <port> fec
+   show interface ethernet <port> status
+   ```
+
+   重点看：
+
+   ```text
+   CRC error 是否增长
+   FEC corrected / uncorrected 是否增长
+   光模块收发光功率是否越界
+   端口是否发生 flap
+   端口速率是否降速
+   ```
+
+6. **做处理前后对比**
+
+   ```text
+   更换光模块 / 光纤 / 端口前记录一次计数器
+   清零或记录当前基线
+   更换后继续跑 NCCL test 或训练任务
+   观察 CRC / FEC / step time 是否恢复
+   ```
+
+   可用于验证的命令：
+
+   ```bash
+   # NCCL tests 示例，具体参数按集群规模调整
+   all_reduce_perf -b 8M -e 8G -f 2 -g <gpus_per_node>
+
+   # 观察 GPU 利用率是否恢复
+   nvidia-smi dmon -s pucm
+   ```
+
 #### 误判风险
 
 这类问题容易被误判为：
@@ -1504,6 +1632,112 @@ PFC 的危险点在于它不是只影响一个流，而是可能阻塞整个优�
 | RDMA retransmission / error | RDMA 是否出现重传或错误 |
 | NCCL timeout | collective 是否超时 |
 
+#### 排查步骤与命令
+
+1. **确认是否是多任务、多节点同时异常**
+
+   ```bash
+   # 从训练日志中统计 timeout / NCCL error 是否集中爆发
+   rg -n "NCCL|timeout|NET/IB|transport error|ibv_poll_cq" /path/to/jobs/*/*.log
+
+   # Kubernetes 场景查看近期任务事件
+   kubectl get events -A --sort-by=.lastTimestamp | tail -n 50
+
+   # Slurm 场景查看任务状态
+   squeue
+   sacct -j <job_id> --format=JobID,State,Elapsed,NodeList%80
+   ```
+
+   判断：
+
+   ```text
+   如果多个任务、多个节点、同一时间段一起变慢，更像 fabric 拥塞或 PFC 扩散。
+   如果只有单个 rank 异常，更像单点链路、网卡或主机问题。
+   ```
+
+2. **主机侧检查 PFC / pause / RDMA 错误**
+
+   ```bash
+   # 查看网卡 pause、丢包、错误、拥塞相关计数
+   ethtool -S <nic> | rg -i "pause|pfc|ecn|cnp|cong|drop|discard|err|timeout|prio"
+
+   # 连续观察 pause / pfc / cnp 是否增长
+   watch -n 5 'ethtool -S <nic> | egrep -i "pause|pfc|ecn|cnp|cong|drop|discard|err"'
+
+   # 查看 RDMA link
+   rdma link
+   ```
+
+   常见关注点：
+
+   ```text
+   rx_prio*_pause / tx_prio*_pause 是否增长
+   CNP / ECN 相关计数是否增长
+   drop / discard 是否增长
+   RDMA completion error 是否出现
+   ```
+
+3. **交换机侧检查 PFC、ECN、buffer、队列**
+
+   ```text
+   show interface ethernet <port> priority-flow-control
+   show interface ethernet <port> counters pfc
+   show interface ethernet <port> counters queue
+   show interface ethernet <port> counters ecn
+   show interface ethernet <port> buffer
+   show qos interface ethernet <port>
+   ```
+
+   重点看：
+
+   ```text
+   PFC pause frame 是否在某些端口暴增
+   ECN marked packets 是否异常增长
+   buffer occupancy 是否长期高水位
+   某个 lossless priority 队列是否持续拥塞
+   pause 是否从下游向上游扩散
+   ```
+
+4. **检查 RoCE 无损配置是否一致**
+
+   ```bash
+   # 主机侧查看 DCB / PFC / ETS 配置，命令可因系统不同而不同
+   dcbtool gc <nic> pfc
+   dcbtool gc <nic> app
+   lldptool -t -i <nic> -V PFC
+   lldptool -t -i <nic> -V ETS-CFG
+   ```
+
+   需要确认：
+
+   ```text
+   主机和交换机 PFC priority 是否一致
+   RoCE 流量是否打到正确 DSCP / PCP
+   lossless 队列是否只承载 RDMA 流量
+   ECN 阈值是否合理
+   DCQCN 参数是否符合厂商建议
+   ```
+
+5. **用 RDMA / NCCL 压测复现**
+
+   ```bash
+   # RDMA 带宽测试，服务端
+   ib_write_bw -d <ib_dev> -i <port>
+
+   # RDMA 带宽测试，客户端
+   ib_write_bw -d <ib_dev> -i <port> <server_ip>
+
+   # NCCL AllReduce 测试
+   all_reduce_perf -b 8M -e 8G -f 2 -g <gpus_per_node>
+   ```
+
+   验证方法：
+
+   ```text
+   压测期间同步观察 PFC / ECN / buffer / queue counters
+   如果压测一启动 pause 和 buffer 就暴涨，说明拥塞控制或队列配置有问题
+   ```
+
 内部分享重点：
 
 > RoCE 网络里最危险的不是简单丢包，而是 PFC 传播 + 队头阻塞 + collective 同步放大。
@@ -1549,6 +1783,113 @@ switch port counters
 straggler rank
 ```
 
+#### 排查步骤与命令
+
+1. **从训练指标中找出慢 rank**
+
+   ```bash
+   # 搜索每个 rank 的 step time、通信耗时或 timeout
+   rg -n "rank|step time|iter time|AllReduce|AllGather|timeout" /path/to/train.log
+
+   # 如果框架会输出 rank 维度指标，可按 rank 聚合分析
+   rg -n "rank [0-9]+.*(step|time|all_reduce|all_gather)" /path/to/train.log
+   ```
+
+   重点判断：
+
+   ```text
+   慢 rank 是否固定
+   慢 rank 是否总在同一台 host
+   慢 rank 是否只在 checkpoint 或数据加载阶段变慢
+   ```
+
+2. **查看异常节点 GPU 是否真的在等**
+
+   ```bash
+   # GPU 实时利用率、显存、功耗
+   nvidia-smi
+   nvidia-smi dmon -s pucm
+
+   # 查看 GPU 拓扑，确认 GPU 和网卡亲和性
+   nvidia-smi topo -m
+   ```
+
+   常见现象：
+
+   ```text
+   多数 GPU util 同时下降，说明可能在等同步。
+   单节点 GPU util 异常，可能是该节点计算、数据、网络或进程问题。
+   ```
+
+3. **检查异常节点 CPU、内存、磁盘、数据加载是否拖后腿**
+
+   ```bash
+   top
+   free -h
+   vmstat 1
+   iostat -xz 1
+   pidstat -dru 1
+   ```
+
+   如果发现：
+
+   ```text
+   CPU 长时间打满
+   iowait 高
+   本地盘延迟高
+   DataLoader 进程异常
+   ```
+
+   则慢 rank 不一定是网络问题，需要继续区分计算、数据和网络瓶颈。
+
+4. **检查异常节点网卡和 RDMA**
+
+   ```bash
+   ip -br link
+   ethtool <nic>
+   ethtool -S <nic> | rg -i "err|drop|discard|pause|timeout|reset|crc|fec"
+   rdma link
+   ibstat
+   ibdev2netdev -v
+   ```
+
+   重点看：
+
+   ```text
+   异常节点是否有错误计数增长
+   是否发生链路降速
+   是否只有某张网卡异常
+   ```
+
+5. **对比正常节点和异常节点**
+
+   ```bash
+   # 正常节点和异常节点分别执行同一组命令，对比输出
+   ethtool -S <nic> | rg -i "err|drop|discard|pause|crc|fec"
+   nvidia-smi dmon -s pucm
+   iostat -xz 1
+   ```
+
+   对比维度：
+
+   ```text
+   GPU util
+   NIC error counters
+   RDMA state
+   CPU iowait
+   本地盘延迟
+   数据加载耗时
+   ```
+
+6. **做节点隔离验证**
+
+   ```text
+   将异常节点从训练任务中摘除或替换
+   使用相同任务规模重新运行
+   如果 step time 恢复，说明慢点与该节点强相关
+   如果问题迁移到其他节点，需要继续看 fabric 或任务本身
+   ```
+
 ### 路径四：存储面网络拥塞导致 GPU 等数据
 
 #### 传导链路
@@ -1577,6 +1918,113 @@ straggler rank
 - 存储客户端错误
 - 文件系统元数据服务延迟
 - checkpoint 与数据读取是否抢占同一存储通道
+
+#### 排查步骤与命令
+
+1. **先区分是通信慢还是数据加载慢**
+
+   ```bash
+   # 搜索训练日志中的 data time、loader time、step time
+   rg -n "data time|dataloader|load data|input time|step time|iter time" /path/to/train.log
+
+   # 搜索 NCCL 错误，确认是否同时存在通信异常
+   rg -n "NCCL|AllReduce|AllGather|timeout|NET/IB" /path/to/train.log
+   ```
+
+   判断：
+
+   ```text
+   data time 上升、NCCL 正常：优先排查存储和数据加载。
+   communication time 上升、NCCL 异常：优先排查算力网络。
+   两者都上升：检查存储面和算力面是否混跑或共同拥塞。
+   ```
+
+2. **训练节点侧检查磁盘和网络**
+
+   ```bash
+   # 磁盘 I/O 和 iowait
+   iostat -xz 1
+   vmstat 1
+
+   # 进程级 I/O
+   pidstat -d 1
+
+   # 存储网卡吞吐和错误
+   ip -s link show <storage_nic>
+   ethtool -S <storage_nic> | rg -i "err|drop|discard|timeout|reset|pause"
+   ```
+
+   重点看：
+
+   ```text
+   训练节点是否在等 I/O
+   存储网卡是否打满
+   存储网卡是否有 drop / error
+   ```
+
+3. **检查挂载和文件系统客户端状态**
+
+   ```bash
+   # 查看挂载点和文件系统类型
+   mount | rg "<dataset_mount>|lustre|nfs|ceph|bee|juice"
+   df -h
+
+   # 查看客户端日志
+   dmesg -T | rg -i "nfs|lustre|ceph|timeout|stale|reset|io error"
+   journalctl -k --since "1 hour ago" | rg -i "nfs|lustre|ceph|timeout|io error"
+   ```
+
+   常见异常：
+
+   ```text
+   NFS timeout
+   Lustre reconnect
+   Ceph slow request
+   metadata server timeout
+   stale file handle
+   ```
+
+4. **做读吞吐基准测试**
+
+   ```bash
+   # 简单顺序读测试，避免写入破坏数据
+   dd if=/path/to/dataset/sample.bin of=/dev/null bs=1M count=4096 iflag=direct status=progress
+
+   # fio 读测试示例，注意选择测试目录和只读参数
+   fio --name=readtest --directory=/path/to/dataset \
+     --rw=read --bs=1M --size=8G --numjobs=4 --iodepth=16 \
+     --direct=1 --runtime=60 --time_based --group_reporting
+   ```
+
+   验证：
+
+   ```text
+   与历史基线或正常节点对比
+   如果单节点读吞吐低，继续看该节点链路和挂载
+   如果所有节点都低，继续看存储集群或存储网络
+   ```
+
+5. **存储服务端 / 存储网络侧检查**
+
+   ```text
+   # 命令因存储系统不同而不同，重点检查：
+   存储节点网卡吞吐和错误
+   存储服务端磁盘延迟
+   元数据服务 CPU / 内存 / 请求延迟
+   客户端连接数和慢请求
+   ```
+
+   常见系统示例：
+
+   ```bash
+   # Ceph 示例
+   ceph -s
+   ceph health detail
+   ceph osd perf
+
+   # NFS 服务端示例
+   nfsstat -s
+   ```
 
 ### 路径五：checkpoint 写入慢导致周期性 step time 尖刺
 
@@ -1607,6 +2055,117 @@ checkpoint 文件很大
 - 存储面网络吞吐
 - 存储系统 IOPS 和元数据延迟
 
+#### 排查步骤与命令
+
+1. **确认 step time 尖刺是否与 checkpoint 时间对齐**
+
+   ```bash
+   # 搜索 checkpoint 保存日志
+   rg -n "checkpoint|ckpt|save model|saving|saved|state_dict" /path/to/train.log
+
+   # 同时搜索 step time
+   rg -n "step time|iter time|tokens/sec|throughput" /path/to/train.log
+   ```
+
+   判断：
+
+   ```text
+   如果每次 save checkpoint 前后 step time 都尖刺，优先排查 checkpoint。
+   如果尖刺没有周期性，需继续排查网络抖动、慢 rank 或数据加载。
+   ```
+
+2. **统计 checkpoint 大小和文件数量**
+
+   ```bash
+   # 查看 checkpoint 目录大小
+   du -sh /path/to/checkpoints/*
+
+   # 统计文件数量，文件过多会放大元数据压力
+   find /path/to/checkpoints/<ckpt_dir> -type f | wc -l
+
+   # 查看最近写入时间
+   ls -lhtr /path/to/checkpoints | tail
+   ```
+
+   重点看：
+
+   ```text
+   单次 checkpoint 总大小
+   文件数量是否过多
+   是否所有 rank 同时写同一目录
+   是否存在小文件风暴
+   ```
+
+3. **训练节点侧观察写入和网络**
+
+   ```bash
+   # checkpoint 期间观察磁盘和 iowait
+   iostat -xz 1
+   vmstat 1
+
+   # 观察进程级写入
+   pidstat -d 1
+
+   # 观察存储网卡吞吐和错误
+   ip -s link show <storage_nic>
+   ethtool -S <storage_nic> | rg -i "err|drop|discard|pause|timeout|reset"
+   ```
+
+4. **做写入基准测试**
+
+   > 注意：写测试必须选择临时目录，避免覆盖训练数据或已有 checkpoint。
+
+   ```bash
+   mkdir -p /path/to/checkpoints/.write-test
+
+   fio --name=writetest --directory=/path/to/checkpoints/.write-test \
+     --rw=write --bs=1M --size=8G --numjobs=4 --iodepth=16 \
+     --direct=1 --runtime=60 --time_based --group_reporting
+   ```
+
+   测完清理：
+
+   ```bash
+   rm -rf /path/to/checkpoints/.write-test
+   ```
+
+5. **检查存储服务端和元数据压力**
+
+   ```text
+   关注：
+   写吞吐是否打满
+   后端磁盘延迟是否升高
+   元数据服务是否高 CPU 或高延迟
+   是否出现慢请求、锁等待、目录热点
+   ```
+
+   Ceph 示例：
+
+   ```bash
+   ceph -s
+   ceph health detail
+   ceph osd perf
+   ```
+
+6. **验证优化措施**
+
+   ```text
+   降低 checkpoint 频率
+   错峰保存 checkpoint
+   使用分片 checkpoint
+   使用异步 checkpoint
+   将数据读取和 checkpoint 写入拆到不同存储路径或网络平面
+   ```
+
+   验证指标：
+
+   ```text
+   checkpoint time 是否下降
+   step time 尖刺是否消失
+   存储写带宽是否更平滑
+   GPU util 是否更稳定
+   ```
+
 ### 路径六：管理网络异常导致调度和监控失真
 
 #### 传导链路
@@ -1634,6 +2193,121 @@ checkpoint 文件很大
 - SSH / API 可达性
 - 监控数据是否缺失
 - BMC / Redfish / IPMI 可达性
+
+#### 排查步骤与命令
+
+1. **确认调度层是否误判节点异常**
+
+   Kubernetes 场景：
+
+   ```bash
+   kubectl get nodes -o wide
+   kubectl describe node <node>
+   kubectl get events -A --sort-by=.lastTimestamp | tail -n 100
+   kubectl get pods -A -o wide | rg "<node>|<job-name>"
+   ```
+
+   Slurm 场景：
+
+   ```bash
+   sinfo -Nel
+   scontrol show node <node>
+   squeue -w <node>
+   sacct -j <job_id> --format=JobID,State,ExitCode,NodeList%80
+   ```
+
+   重点看：
+
+   ```text
+   NodeReady 是否变化
+   节点是否被 drain / down
+   任务是否被驱逐、重启、requeue
+   事件时间是否与训练异常时间一致
+   ```
+
+2. **检查带内管理网络连通性**
+
+   ```bash
+   # 从运维节点或调度节点测试
+   ping -c 5 <node_mgmt_ip>
+   mtr -rwzc 20 <node_mgmt_ip>
+
+   # 检查常用端口
+   nc -vz <node_mgmt_ip> 22
+   nc -vz <node_mgmt_ip> <agent_port>
+   ```
+
+   节点侧检查：
+
+   ```bash
+   ip addr
+   ip route
+   ip -s link show <mgmt_nic>
+   ethtool <mgmt_nic>
+   ethtool -S <mgmt_nic> | rg -i "err|drop|discard|timeout|reset"
+   ```
+
+3. **检查 agent / kubelet / slurmd / 监控进程**
+
+   ```bash
+   # Kubernetes 节点
+   systemctl status kubelet
+   journalctl -u kubelet --since "1 hour ago"
+
+   # Slurm 节点
+   systemctl status slurmd
+   journalctl -u slurmd --since "1 hour ago"
+
+   # 监控 agent 示例
+   systemctl status node_exporter
+   journalctl -u node_exporter --since "1 hour ago"
+   ```
+
+   重点看：
+
+   ```text
+   心跳是否超时
+   证书或认证是否异常
+   agent 是否重启
+   是否因为管理网络抖动导致连接断开
+   ```
+
+4. **检查带外管理网络和 BMC**
+
+   ```bash
+   # IPMI 示例
+   ipmitool -I lanplus -H <bmc_ip> -U <user> chassis status
+   ipmitool -I lanplus -H <bmc_ip> -U <user> sensor
+
+   # Redfish 示例
+   curl -k -u <user>:<password> https://<bmc_ip>/redfish/v1/Systems/
+   ```
+
+   重点看：
+
+   ```text
+   BMC 是否可达
+   是否能读取电源、温度、风扇、硬件告警
+   OS 不可达时是否还能通过 BMC 重启或采集信息
+   ```
+
+5. **确认监控数据是否缺失或延迟**
+
+   ```text
+   在 Prometheus / 监控平台中检查：
+   up 指标是否为 0
+   scrape_duration 是否升高
+   scrape_samples 是否突然下降
+   节点指标是否出现断点
+   ```
+
+   PromQL 示例：
+
+   ```promql
+   up{instance="<node>:9100"}
+   rate(node_network_receive_drop_total{instance="<node>:9100"}[5m])
+   rate(node_network_transmit_drop_total{instance="<node>:9100"}[5m])
+   ```
 
 ---
 
