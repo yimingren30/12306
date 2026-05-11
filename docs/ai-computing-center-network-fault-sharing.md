@@ -2751,6 +2751,239 @@ flowchart TB
 | 带内管理网络 | kubelet、device plugin、监控、日志、SSH | K8s API、metrics、logging、运维操作 | 节点 NotReady、监控缺失、误驱逐 |
 | 带外管理网络 | BMC、硬件状态、远程重启 | IPMI / Redfish | 节点死机后无法救援 |
 
+#### K8s 集群节点间需要什么交换机
+
+千卡 AI 集群不能用“普通办公接入交换机 + 一张大二层网络”的思路建设。
+不同网络平面应使用不同能力等级的交换机，或者至少在高端交换机上用 VRF / VLAN / ACL / QoS 做强隔离。
+
+| 网络平面 | 推荐交换机类型 | 关键能力 | 典型端口速率 | 说明 |
+|---|---|---|---|---|
+| 算力网络 | 数据中心高性能以太网交换机 / RoCE 交换机 | 低时延、高吞吐、PFC、ECN、DCB、QoS、大缓存、Telemetry、ECMP | 100G / 200G / 400G / 800G | 承载 HCCL 跨节点通信，不能用普通管理交换机替代 |
+| 存储面网络 | 高吞吐数据中心交换机 | 大带宽、稳定转发、拥塞可观测、必要时支持 RDMA | 25G / 100G / 200G / 400G | 承载模型权重加载、日志、缓存、对象存储或并行文件系统流量 |
+| 参数面 / 带内管理网络 | 企业级或数据中心管理交换机 | 稳定性、ACL、VRF、可观测、冗余上联 | 10G / 25G / 100G | 承载 kubelet、API Server、服务发现、RankTable 下发、监控日志 |
+| 带外管理网络 | 独立 BMC 管理交换机 | 安全隔离、低速稳定、访问控制 | 1G / 10G | 只连接 BMC / IPMI / Redfish，不能暴露给业务 Pod |
+
+如果使用华为生态，可以选择支持 RoCE、PFC、ECN、Telemetry、数据中心 leaf-spine 组网能力的 CloudEngine 类交换机；如果使用其他厂商，也要看是否具备同等能力。关键不是品牌名称，而是交换机必须满足：
+
+```text
+高端口速率
+低转发时延
+足够 buffer
+RoCE 无损或低丢包能力
+PFC / ECN / QoS 可配置
+端口错误、队列、buffer、PFC、ECN 可观测
+支持 leaf-spine 横向扩展
+```
+
+不建议：
+
+```text
+算力网络、存储网络、管理网络全部混在同一组普通交换机上。
+HCCL / RoCE 流量走 Kubernetes overlay 网络。
+所有 128 台服务器挂在一两台超大二层交换机上，缺少故障域拆分。
+带外 BMC 网络和业务网络互通。
+```
+
+#### 千卡集群怎么组建网络
+
+推荐使用 **leaf-spine Clos 架构**，而不是单层大二层。
+
+```text
+服务器 / AI 节点
+=> leaf 交换机，也叫 ToR / 接入层
+=> spine 交换机，也叫骨干层
+=> 其他 leaf 下的服务器
+```
+
+简化拓扑：
+
+```text
+                 Compute Spine 1     Compute Spine 2
+                       |                    |
+        -------------------------------------------------
+        |                       |                       |
+  Compute Leaf A          Compute Leaf B          Compute Leaf C
+        |                       |                       |
+   16 台 Ascend 节点       16 台 Ascend 节点       16 台 Ascend 节点
+
+                 Storage Spine / Storage Leaf
+                          |
+                   模型存储 / 对象存储 / 文件系统
+
+                 Mgmt Leaf / OOB Leaf
+                          |
+              K8s 管理面 / 监控 / BMC / 运维平台
+```
+
+一个可落地的千卡拆分示例：
+
+```text
+128 台服务器，每台 8 张 Ascend 910B
+
+8 个机柜或 8 个拓扑域
+每个拓扑域 16 台服务器 = 128 张 NPU
+每个拓扑域配置独立 compute leaf 组
+所有 compute leaf 上联到 compute spine
+存储 leaf / spine 与算力 leaf / spine 分离
+管理 leaf 和 BMC leaf 分离
+```
+
+##### 1. 算力网络组网
+
+算力网络承载 HCCL 通信，是最需要重点设计的部分。
+
+设计原则：
+
+```text
+同一个强通信推理副本尽量落在同一台服务器或同一组 leaf 下。
+跨 leaf 通信必须走 spine，但要保证 spine 上联带宽足够。
+算力网络建议 1:1 无收敛，至少低收敛比。
+RoCE 场景必须配置 PFC / ECN / QoS，并持续监控队列和 pause。
+```
+
+带宽估算公式：
+
+```text
+leaf 下行带宽 = 节点数 x 每节点算力网卡数 x 单端口速率
+leaf 上行带宽 = 上联 spine 端口数 x 单端口速率
+收敛比 = leaf 下行带宽 / leaf 上行带宽
+```
+
+示例：
+
+```text
+一个拓扑域 16 台服务器
+每台服务器 4 x 200G 算力网卡
+
+leaf 下行带宽 = 16 x 4 x 200G = 12.8T
+如果希望 1:1 无收敛：
+leaf 上行到 spine 也要约 12.8T
+例如 32 x 400G 上联，或按实际交换机端口能力拆成多台 leaf
+```
+
+如果每台服务器是 8 x 200G、4 x 400G 或其他配置，只需代入同样公式计算。重点是：
+
+> 不能只看交换机端口“够不够插”，还要看上联带宽、收敛比、buffer、PFC/ECN 和故障域。
+
+算力网络常见交换机能力要求：
+
+```text
+支持 100G / 200G / 400G / 800G 高速端口
+支持 RoCEv2
+支持 PFC、ECN、QoS、DSCP/PCP 映射
+支持 ECMP，多路径负载均衡
+支持端口级 CRC/FEC/PFC/ECN/buffer telemetry
+支持 BGP underlay 或等价三层 leaf-spine 方案
+```
+
+##### 2. 存储面网络组网
+
+存储面用于模型权重加载、版本切换、日志、缓存和文件系统访问。
+推理集群扩容时，存储面很容易成为瓶颈。
+
+设计原则：
+
+```text
+存储面和算力面分离，避免模型加载冲击 HCCL 通信。
+模型权重读取高峰要有足够吞吐。
+对象存储、并行文件系统、缓存节点尽量靠近计算拓扑域。
+必要时在每个 pod / 机柜部署本地缓存或 NVMe 预热。
+```
+
+典型组网：
+
+```text
+Ascend 节点 storage NIC
+=> storage leaf
+=> storage spine
+=> 模型仓库 / 对象存储网关 / 并行文件系统 / 缓存集群
+```
+
+存储面交换机关注：
+
+```text
+吞吐
+丢包
+队列拥塞
+元数据服务访问延迟
+扩容期间并发读带宽
+```
+
+##### 3. 参数面和带内管理网络组网
+
+参数面和带内管理网络可以物理分开，也可以在同一组数据中心管理交换机上通过 VRF / VLAN / ACL 做隔离。
+
+承载流量：
+
+```text
+Kubernetes API Server
+kubelet 心跳
+Ascend device plugin
+推理服务注册
+RankTable 下发
+模型路由控制
+监控采集
+日志采集
+SSH / 运维操作
+```
+
+设计原则：
+
+```text
+可靠性优先，不追求极限低延迟。
+不要和 HCCL 算力通信混跑。
+要能通过 ACL 控制谁可以访问 API Server、节点 SSH、监控端口。
+监控和日志高峰不能影响 kubelet 心跳。
+```
+
+##### 4. 带外管理网络组网
+
+带外管理网络只连接 BMC / IPMI / Redfish。
+
+设计原则：
+
+```text
+物理独立或强逻辑隔离。
+只允许堡垒机、硬件管理平台、自动化装机平台访问。
+禁止业务 Pod、模型服务、普通用户网络访问 BMC。
+保留独立交换机和独立地址段。
+```
+
+##### 5. Kubernetes 网络和 HCCL 通信网络的关系
+
+Kubernetes 自身需要 CNI 网络，例如 Calico、Cilium 或其他 CNI，用于 Pod IP、Service、DNS、控制面访问。
+但 HCCL / RoCE 这类高速通信不建议走普通 overlay 网络。
+
+推荐理解：
+
+```text
+K8s CNI 网络：
+  负责 Pod 管理、Service、控制面、普通东西向访问。
+
+HCCL / 算力通信网络：
+  负责 NPU 间高速通信，通常绑定高速物理网卡、hostNetwork、SR-IOV、macvlan 或厂商插件能力。
+
+存储网络：
+  负责模型权重和数据访问，通过 CSI / 挂载点 / 存储客户端进入 Pod。
+```
+
+也就是说：
+
+> Kubernetes 负责“调度谁跑在哪里”，但真正的 NPU 间高速通信要依赖底层算力网络、HCCL、RankTable 和高性能网卡，不是靠 Kubernetes overlay 自动解决。
+
+#### 网络建设落地清单
+
+| 检查项 | 要点 |
+|---|---|
+| 交换机选型 | 算力交换机必须支持高速端口、PFC、ECN、QoS、Telemetry |
+| 拓扑 | 千卡规模建议 leaf-spine，不建议单层大二层 |
+| 收敛比 | 算力网络建议 1:1 或低收敛；存储面按模型加载峰值设计 |
+| 网络隔离 | 算力、存储、参数/管理、带外管理分离 |
+| RoCE 配置 | PFC priority、ECN 阈值、DSCP/PCP、DCQCN 参数一致 |
+| K8s 集成 | CNI 管 Pod 网络，HCCL 走高速通信网络 |
+| 调度标签 | 节点要打 leaf、pod、rack、zone、storage-domain 等拓扑标签 |
+| 观测能力 | 端口 CRC/FEC/PFC/ECN/buffer、NPU、HCCL、kubelet 都要可观测 |
+
 ### 软件栈参考
 
 一个典型软件栈可以是：
@@ -2777,6 +3010,83 @@ flowchart TB
 | Volcano / Gang Scheduler | 保证一个多卡分布式推理副本所需资源同时被调度 |
 | NPU Exporter | 采集 NPU 利用率、显存、温度、错误码等指标 |
 | RankTable | HCCL 分布式通信初始化所需的 rank 到设备 / IP 映射信息 |
+
+#### Volcano 是什么
+
+**Volcano** 是 Kubernetes 生态中的云原生批量计算 / AI 任务调度系统。
+它不是网络组件，也不是通信库，不负责让 HCCL 变快；它负责把一组彼此强依赖的 Pod 按 AI 任务语义整体调度好。
+
+可以这样理解：
+
+```text
+Kubernetes 默认调度器：
+  更擅长一个 Pod 一个 Pod 地调度通用服务。
+
+Volcano：
+  更擅长调度 AI 训练、分布式推理、HPC、大数据这类“成组任务”。
+```
+
+Volcano 在千卡 Ascend 推理场景中的价值：
+
+| 能力 | 解决什么问题 |
+|---|---|
+| Gang scheduling | 一个 16 卡副本需要的多个 Pod / rank 要么一起调度成功，要么一起等待 |
+| Queue | 多团队、多模型、多租户共享千卡资源池时，可以按队列管理资源 |
+| Priority | 重要模型服务或线上推理任务可以有更高优先级 |
+| Fair-share | 防止一个团队或一个模型占满全部资源 |
+| Preemption | 高优任务资源不足时，可以按策略抢占低优任务 |
+| Backfill | 利用资源空洞运行小任务，提高集群利用率 |
+| Job / PodGroup | 用 PodGroup 描述“一组 Pod 是一个整体任务” |
+
+为什么默认 K8s 调度器不够：
+
+```text
+一个 16 卡推理副本需要 2 个 Pod，每个 Pod 8 张 NPU。
+
+默认调度器可能先调度成功 1 个 Pod：
+  rank 0-7 已经启动，占住 8 张 NPU
+
+另一个 Pod 因为资源不足 Pending：
+  rank 8-15 没启动
+
+结果：
+  HCCL 初始化失败
+  推理副本不可用
+  已启动 Pod 占住资源但不能服务
+```
+
+Volcano 的 gang scheduling 会把这个副本作为整体看待：
+
+```text
+如果 16 张 NPU 都能满足：
+  一起调度，副本启动。
+
+如果只能满足 8 张 NPU：
+  整体等待，不半启动。
+```
+
+Volcano 和前面组件的关系：
+
+```text
+Volcano：
+  负责调度和资源编排。
+
+Ascend Device Plugin：
+  负责把 Ascend 910B 资源汇报给 Kubernetes。
+
+HCCL：
+  负责 NPU 间集合通信。
+
+RankTable：
+  负责告诉 HCCL 每个 rank 在哪里。
+
+算力网络：
+  负责真正承载 HCCL 数据包。
+```
+
+一句话：
+
+> Volcano 解决的是“这组多卡 Pod 能不能作为一个整体被正确调度”的问题，不解决“交换机怎么转发、HCCL 怎么通信、RoCE 怎么调优”的问题。
 
 ### Kubernetes 节点准备
 
