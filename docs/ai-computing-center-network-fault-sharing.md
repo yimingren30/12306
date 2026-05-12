@@ -2815,6 +2815,189 @@ HCCL / RoCE 流量走 Kubernetes overlay 网络。
               K8s 管理面 / 监控 / BMC / 运维平台
 ```
 
+##### 拓扑连接图：四张网同时接入一台 Ascend 节点
+
+下面这张图用于帮助新人理解：一台 AI 服务器不是只插一根网线，而是同时接入算力、存储、管理、带外等多张网络。
+
+```mermaid
+flowchart TB
+    subgraph Node[Ascend 910B AI 服务器]
+        NPU[8 x Ascend 910B]
+        ComputeNIC[算力网卡<br/>RoCE/HCCL]
+        StorageNIC[存储网卡]
+        MgmtNIC[带内管理网卡]
+        BMCNIC[BMC 管理口]
+        NVMe[本地 NVMe 缓存]
+    end
+
+    subgraph ComputeFabric[算力网络 Fabric]
+        CLeaf[Compute Leaf / ToR]
+        CSpine[Compute Spine]
+    end
+
+    subgraph StorageFabric[存储网络 Fabric]
+        SLeaf[Storage Leaf]
+        SSpine[Storage Spine]
+        Storage[对象存储/并行文件系统/模型仓库]
+    end
+
+    subgraph MgmtFabric[管理网络]
+        MLeaf[Mgmt Leaf]
+        APIServer[K8s API Server]
+        Monitor[监控/日志/镜像仓库]
+    end
+
+    subgraph OOBFabric[带外管理网络]
+        OOBLeaf[OOB Switch]
+        BMCPlatform[BMC/IPMI/Redfish 管理平台]
+    end
+
+    NPU --- ComputeNIC
+    ComputeNIC --> CLeaf --> CSpine
+    StorageNIC --> SLeaf --> SSpine --> Storage
+    StorageNIC --> NVMe
+    MgmtNIC --> MLeaf --> APIServer
+    MLeaf --> Monitor
+    BMCNIC --> OOBLeaf --> BMCPlatform
+```
+
+核心理解：
+
+```text
+算力网卡：给 HCCL / NPU 间通信用。
+存储网卡：给模型权重、Tokenizer、配置、日志、缓存用。
+带内管理网卡：给 Kubernetes、监控、SSH、日志采集用。
+BMC 口：给机器断网、死机、OS 崩溃后的硬件救援用。
+```
+
+##### 机柜实物连线示意图
+
+下面是“看得见的线怎么插”的实物连接示意。它不是照片，而是机柜视角的物理连线图。
+
+```text
+单个机柜 / 单个拓扑域示例：16 台 Ascend 服务器
+
+┌──────────────────────────────────────────────────────────────┐
+│                         机柜 Rack-A                           │
+│                                                              │
+│  ┌───────────────────────交换机区──────────────────────────┐  │
+│  │  [Compute Leaf-1] [Compute Leaf-2]  <-- 400G/800G 上联 Spine │
+│  │  [Storage Leaf]                    <-- 100G/200G 上联存储网 │
+│  │  [Mgmt Leaf]                       <-- 10G/25G 管理网       │
+│  │  [OOB Switch]                      <-- 1G/10G BMC 管理网    │
+│  └──────────────────────────────────────────────────────────┘  │
+│                                                              │
+│  ┌──────────────────────服务器区────────────────────────────┐  │
+│  │  Server-01  8 x Ascend 910B                              │  │
+│  │     compute NICs  ======> Compute Leaf-1/2                │  │
+│  │     storage NIC   ======> Storage Leaf                    │  │
+│  │     mgmt NIC      ======> Mgmt Leaf                       │  │
+│  │     BMC port      ======> OOB Switch                      │  │
+│  │                                                          │  │
+│  │  Server-02  8 x Ascend 910B                              │  │
+│  │     compute NICs  ======> Compute Leaf-1/2                │  │
+│  │     storage NIC   ======> Storage Leaf                    │  │
+│  │     mgmt NIC      ======> Mgmt Leaf                       │  │
+│  │     BMC port      ======> OOB Switch                      │  │
+│  │                                                          │  │
+│  │  ...                                                     │  │
+│  │                                                          │  │
+│  │  Server-16  8 x Ascend 910B                              │  │
+│  │     compute NICs  ======> Compute Leaf-1/2                │  │
+│  │     storage NIC   ======> Storage Leaf                    │  │
+│  │     mgmt NIC      ======> Mgmt Leaf                       │  │
+│  │     BMC port      ======> OOB Switch                      │  │
+│  └──────────────────────────────────────────────────────────┘  │
+│                                                              │
+└──────────────────────────────────────────────────────────────┘
+
+8 个类似 Rack / Pod
+=> 128 台服务器
+=> 1024 张 Ascend 910B
+```
+
+实物布线建议：
+
+```text
+compute NIC 尽量双归到不同 compute leaf，避免单 leaf 故障影响整台服务器。
+storage NIC 不要插到 compute leaf 上，避免模型加载流量冲击 HCCL。
+mgmt NIC 单独走管理交换机，保证 kubelet 心跳和监控稳定。
+BMC port 只接 OOB switch，不接业务网。
+每根线缆、光模块、交换机端口都要进入资产系统，形成 server => NIC => switch => port 映射。
+```
+
+##### 千卡整体拓扑图
+
+```mermaid
+flowchart TB
+    subgraph Compute[算力网络 Leaf-Spine]
+        CS1[Compute Spine 1]
+        CS2[Compute Spine 2]
+        CL1[Compute Leaf A<br/>Rack-A 16 台服务器]
+        CL2[Compute Leaf B<br/>Rack-B 16 台服务器]
+        CL3[Compute Leaf C<br/>Rack-C 16 台服务器]
+        CL8[Compute Leaf H<br/>Rack-H 16 台服务器]
+        CS1 --- CL1
+        CS1 --- CL2
+        CS1 --- CL3
+        CS1 --- CL8
+        CS2 --- CL1
+        CS2 --- CL2
+        CS2 --- CL3
+        CS2 --- CL8
+    end
+
+    subgraph Servers[AI 服务器资源池]
+        R1[Rack-A<br/>16 x 8卡 = 128 NPU]
+        R2[Rack-B<br/>16 x 8卡 = 128 NPU]
+        R3[Rack-C<br/>16 x 8卡 = 128 NPU]
+        R8[Rack-H<br/>16 x 8卡 = 128 NPU]
+    end
+
+    subgraph StoragePlane[存储面]
+        SL[Storage Leaf/Spine]
+        OBJ[对象存储]
+        FS[并行文件系统]
+        Cache[模型缓存/NVMe 预热]
+    end
+
+    subgraph ControlPlane[参数面/管理面]
+        ML[Mgmt Leaf]
+        K8S[K8s Control Plane]
+        Router[模型路由/服务发现]
+        Mon[Prometheus/日志]
+    end
+
+    subgraph OOB[带外管理]
+        OOBSW[OOB Switch]
+        BMC[BMC 管理平台]
+    end
+
+    CL1 --- R1
+    CL2 --- R2
+    CL3 --- R3
+    CL8 --- R8
+    R1 --- SL
+    R2 --- SL
+    R3 --- SL
+    R8 --- SL
+    SL --- OBJ
+    SL --- FS
+    SL --- Cache
+    R1 --- ML
+    R2 --- ML
+    R3 --- ML
+    R8 --- ML
+    ML --- K8S
+    ML --- Router
+    ML --- Mon
+    R1 --- OOBSW
+    R2 --- OOBSW
+    R3 --- OOBSW
+    R8 --- OOBSW
+    OOBSW --- BMC
+```
+
 一个可落地的千卡拆分示例：
 
 ```text
@@ -2983,6 +3166,73 @@ HCCL / 算力通信网络：
 | K8s 集成 | CNI 管 Pod 网络，HCCL 走高速通信网络 |
 | 调度标签 | 节点要打 leaf、pod、rack、zone、storage-domain 等拓扑标签 |
 | 观测能力 | 端口 CRC/FEC/PFC/ECN/buffer、NPU、HCCL、kubelet 都要可观测 |
+
+##### K8s 中到底使用什么交换机组网
+
+从 Kubernetes 视角看，`Node` 只是一个可调度对象；从机房视角看，每个 `Node` 背后至少有四类交换机。建议按下面方式落地：
+
+| K8s 相关流量 | 使用的交换机 | 建议能力 | 是否承载 HCCL |
+|---|---|---|---|
+| Pod IP、Service、DNS、API Server、kubelet | 带内管理 / 参数面交换机 | 10G / 25G / 100G，ACL，VRF，稳定三层互通 | 否 |
+| NPU 间 HCCL 通信 | 算力网络 RoCE 交换机 | 200G / 400G / 800G，PFC，ECN，QoS，Telemetry，低时延 | 是 |
+| 模型权重、PVC、对象存储、并行文件系统 | 存储面交换机 | 100G / 200G / 400G，高吞吐，低丢包，拥塞可观测 | 否 |
+| BMC / IPMI / Redfish | 带外管理交换机 | 1G / 10G，强 ACL，堡垒机访问 | 否 |
+
+如果用华为网络设备，可按能力选择 CloudEngine 数据中心交换机：
+
+```text
+算力网络：
+  选择支持 200G / 400G / 800G、RoCE、PFC、ECN、Telemetry 的数据中心交换机。
+  常见形态是高性能 leaf + spine，按端口和带宽需求选择固定盒式或框式设备。
+
+存储网络：
+  选择高吞吐数据中心交换机，重点看上联带宽、buffer、丢包和拥塞可观测。
+
+参数面 / 管理网络：
+  选择稳定的 10G / 25G / 100G 数据中心或园区管理交换机。
+
+带外网络：
+  选择独立 1G / 10G 管理交换机，和业务网络物理或强逻辑隔离。
+```
+
+注意：
+
+```text
+Kubernetes 并不要求必须使用某个品牌或型号的交换机。
+Kubernetes 需要的是稳定的 Node IP、Pod 网络、Service 网络和控制面连接。
+大模型推理额外需要高性能算力网络承载 HCCL。
+所以交换机选型要按流量平面来选，而不是按“K8s 交换机”这个笼统概念来选。
+```
+
+##### K8s 网络、算力网络、存储网络的分层图
+
+```mermaid
+flowchart LR
+    Pod[推理 Pod] --> CNI[K8s CNI<br/>Pod IP/Service/DNS]
+    Pod --> HCCL[HCCL 通信接口<br/>RankTable 指定通信 IP]
+    Pod --> Mount[模型挂载路径<br/>/models]
+
+    CNI --> MgmtSwitch[参数面/管理交换机]
+    MgmtSwitch --> APIServer[K8s API Server]
+    MgmtSwitch --> Service[Service/Endpoint/模型路由]
+
+    HCCL --> ComputeSwitch[算力 RoCE 交换机]
+    ComputeSwitch --> OtherRank[其他 Rank / 其他 NPU]
+
+    Mount --> StorageSwitch[存储交换机]
+    StorageSwitch --> PVC[CSI/PVC 文件系统]
+    StorageSwitch --> Object[对象存储/模型仓库]
+    StorageSwitch --> Cache[本地 NVMe/缓存节点]
+```
+
+这张图的关键点：
+
+```text
+CNI 解决 Pod 如何被管理和访问。
+HCCL 解决 NPU rank 之间如何高速通信。
+CSI/PVC 或对象存储解决模型权重如何进入 Pod。
+这三件事可以在同一个 Pod 里发生，但底层最好走不同网络平面。
+```
 
 ### 软件栈参考
 
@@ -3335,6 +3585,237 @@ podAffinity 尽量把同一副本放在同一 leaf 拓扑域
 模型权重从存储面挂载
 ```
 
+### K8s 中推理服务使用什么存储
+
+大模型推理场景里的“存储”不是单一系统，通常会分成四层：
+
+| 存储层 | 作用 | 典型技术 | K8s 接入方式 | 关键要求 |
+|---|---|---|---|---|
+| 模型仓库 | 保存模型权重、Tokenizer、配置、版本元数据 | 对象存储 OBS / S3 / MinIO，模型仓库服务 | initContainer 下载，或模型管理服务拉取 | 容量大、版本管理、权限控制 |
+| 共享文件系统 | 多节点共享读取模型文件 | Lustre、GPFS、BeeGFS、CephFS、NAS | CSI + PVC，通常 ReadOnlyMany | 高读吞吐、元数据性能好 |
+| 本地缓存 | 避免每次启动都从远端拉大模型 | 本地 NVMe、Local PV、hostPath、缓存 DaemonSet | Local PV / hostPath / emptyDir 预热 | 启动快、减少存储面尖峰 |
+| 日志和监控存储 | 保存推理日志、请求统计、指标 | Elasticsearch、Loki、对象存储、时序数据库 | sidecar / agent / remote write | 不影响推理主链路 |
+
+推荐实践：
+
+```text
+模型权重主存放：对象存储或模型仓库。
+推理 Pod 实际读取：优先读取本地 NVMe 缓存或高性能共享文件系统。
+多副本扩容：先预热模型，再让 readiness 通过。
+日志和指标：单独走日志/监控链路，不要写到模型权重目录。
+```
+
+不建议：
+
+```text
+每个推理 Pod 启动时都直接从对象存储拉取数百 GB 权重。
+所有副本同时读同一个共享目录，且没有缓存和限速。
+把模型权重、日志、临时文件、监控数据全部写到同一个 PVC。
+用普通低性能 NAS 承载千卡集群的大模型冷启动。
+```
+
+#### StorageClass / PVC 示例
+
+下面示例表达的是“模型权重通过共享文件系统以只读方式挂载到推理 Pod”。具体 `provisioner` 和参数要按实际 CSI 插件调整。
+
+```yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: llm-model-rox
+provisioner: csi.example.com
+parameters:
+  fsType: cephfs
+  storageNetwork: storage-a
+reclaimPolicy: Retain
+allowVolumeExpansion: true
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: llm-model-pvc
+  namespace: llm-serving
+spec:
+  accessModes:
+    - ReadOnlyMany
+  storageClassName: llm-model-rox
+  resources:
+    requests:
+      storage: 20Ti
+```
+
+如果使用对象存储作为模型仓库，常见做法是：
+
+```text
+initContainer / 模型预热 DaemonSet
+=> 从 OBS / S3 / MinIO 下载指定模型版本
+=> 写入节点本地 NVMe 缓存
+=> 主推理容器从本地路径加载模型
+```
+
+简化示例：
+
+```yaml
+initContainers:
+  - name: model-warmup
+    image: registry.example.com/tools/model-sync:latest
+    env:
+      - name: MODEL_URI
+        value: s3://llm-models/qwen-70b/v1/
+      - name: LOCAL_MODEL_DIR
+        value: /cache/models/qwen-70b/v1
+    volumeMounts:
+      - name: model-cache
+        mountPath: /cache/models
+containers:
+  - name: infer
+    image: registry.example.com/llm/ascend-infer:latest
+    env:
+      - name: MODEL_PATH
+        value: /cache/models/qwen-70b/v1
+    volumeMounts:
+      - name: model-cache
+        mountPath: /cache/models
+volumes:
+  - name: model-cache
+    hostPath:
+      path: /data/model-cache
+      type: DirectoryOrCreate
+```
+
+这个模式的优点：
+
+```text
+远端对象存储负责模型版本管理。
+本地 NVMe 负责推理启动速度。
+存储面网络只在预热和版本切换时承受压力。
+推理主流程不需要频繁访问远端存储。
+```
+
+### 推理服务、K8s 和存储怎么交互
+
+#### 控制面交互
+
+```mermaid
+sequenceDiagram
+    participant User as 用户/发布系统
+    participant APIServer as K8s API Server
+    participant Volcano as Volcano Scheduler
+    participant Kubelet as Kubelet
+    participant CSI as CSI/存储插件
+    participant Pod as 推理 Pod
+    participant Registry as 镜像仓库
+    participant ModelStore as 模型仓库/对象存储
+
+    User->>APIServer: 提交模型推理 Job/CRD
+    APIServer->>Volcano: 创建 PodGroup / 等待成组调度
+    Volcano->>APIServer: 选择满足 NPU 和拓扑的节点
+    APIServer->>Kubelet: 下发 Pod 到目标节点
+    Kubelet->>Registry: 拉取推理镜像
+    Kubelet->>CSI: 挂载 PVC 或准备本地缓存目录
+    Pod->>ModelStore: initContainer 拉取/校验模型权重
+    Pod->>Pod: 生成 RankTable / 初始化 HCCL
+    Pod->>APIServer: readiness 通过，进入可服务状态
+```
+
+#### 数据面交互
+
+```mermaid
+sequenceDiagram
+    participant Client as 客户端
+    participant Gateway as API Gateway
+    participant Router as 模型路由
+    participant Service as K8s Service/Endpoint
+    participant Pod as 16卡推理副本
+    participant HCCL as HCCL/算力网络
+    participant Cache as 本地NVMe/模型缓存
+
+    Client->>Gateway: 发送推理请求
+    Gateway->>Router: 鉴权、限流、选择模型版本
+    Router->>Service: 选择健康副本
+    Service->>Pod: 请求进入推理副本
+    Pod->>Cache: 读取已预热模型权重/KV配置
+    Pod->>HCCL: 多 rank 交换中间结果
+    HCCL-->>Pod: 返回集合通信结果
+    Pod-->>Service: 返回 token 流
+    Service-->>Router: 返回推理结果
+    Router-->>Gateway: 返回结果
+    Gateway-->>Client: 返回给客户端
+```
+
+这两张图要区分：
+
+```text
+控制面：负责调度、挂载、启动、健康检查。
+数据面：负责真正的请求推理、模型读取、NPU 计算和 HCCL 通信。
+```
+
+#### 存储与推理服务的关键设计点
+
+1. **模型版本不可变**
+
+   ```text
+   /models/qwen-70b/v1
+   /models/qwen-70b/v2
+   ```
+
+   不要在同一个路径上原地覆盖模型文件，否则正在运行的 Pod 可能读到不一致权重。
+
+2. **readiness 必须等待模型加载完成**
+
+   ```text
+   Pod Running 不等于可以接流量。
+   必须等模型权重加载完成、HCCL 初始化完成、预热请求成功后 readiness 才通过。
+   ```
+
+3. **扩容要分批预热**
+
+   ```text
+   先预热模型到目标节点。
+   再启动少量副本。
+   验证延迟和错误率。
+   最后逐批扩容和切流。
+   ```
+
+4. **存储面要和算力面隔离**
+
+   ```text
+   模型加载走 storage leaf / spine。
+   HCCL 通信走 compute leaf / spine。
+   两者混跑时，模型冷启动可能导致推理 p99 抖动。
+   ```
+
+5. **缓存命中率要监控**
+
+   ```text
+   如果本地缓存命中率低，每次扩容都会打远端存储。
+   需要监控模型预热耗时、缓存命中率、远端读吞吐、PVC 挂载耗时。
+   ```
+
+#### 运行时检查命令
+
+```bash
+# 看 Pod 是否真的 Ready
+kubectl get pod -n llm-serving -o wide
+kubectl describe pod -n llm-serving <pod>
+
+# 看 PVC 是否正常绑定和挂载
+kubectl get pvc -n llm-serving
+kubectl describe pvc -n llm-serving llm-model-pvc
+
+# 看模型加载日志
+kubectl logs -n llm-serving <pod> -c model-warmup
+kubectl logs -n llm-serving <pod> -c infer | rg -i "load|model|weight|ready|hccl|rank"
+
+# 进入 Pod 查看模型文件和缓存
+kubectl exec -n llm-serving -it <pod> -- df -h
+kubectl exec -n llm-serving -it <pod> -- ls -lh /models
+
+# 节点侧看存储网卡和磁盘压力
+ip -s link show <storage_nic>
+iostat -xz 1
+```
+
 ### RankTable 和通信初始化
 
 Ascend HCCL 通信通常需要知道：
@@ -3393,10 +3874,11 @@ HCCL 报 rank 9 timeout
 1. 用户请求进入 API Gateway。
 2. 模型路由层选择模型版本和可用副本。
 3. 请求进入某个 16 卡推理副本。
-4. Prefill 阶段处理 prompt，通常计算量大、显存和带宽压力高。
-5. Decode 阶段逐 token 生成，对尾延迟和抖动非常敏感。
-6. 副本内多张 NPU 通过 HCCL / 高速网络交换中间结果。
-7. 结果返回模型路由层，再返回用户。
+4. 推理副本确认模型权重已经从 PVC / 本地 NVMe 缓存加载完成。
+5. Prefill 阶段处理 prompt，通常计算量大、显存和带宽压力高。
+6. Decode 阶段逐 token 生成，对尾延迟和抖动非常敏感。
+7. 副本内多张 NPU 通过 HCCL / 高速网络交换中间结果。
+8. 结果返回模型路由层，再返回用户。
 ```
 
 对应指标：
