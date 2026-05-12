@@ -19,8 +19,9 @@
 10. [内部复盘模板](#内部复盘模板)
 11. [分享案例](#分享案例)
 12. [实际场景：基于 Ascend 910B 的千卡服务器直连交换机分布式推理集群](#实际场景基于-ascend-910b-的千卡服务器直连交换机分布式推理集群)
-13. [延伸阅读与实践材料](#延伸阅读与实践材料)
-14. [一页总结](#一页总结)
+13. [昇腾 910B 算力运维知识](#昇腾-910b-算力运维知识)
+14. [延伸阅读与实践材料](#延伸阅读与实践材料)
+15. [一页总结](#一页总结)
 
 ---
 
@@ -3364,6 +3365,503 @@ ipmitool -I lanplus -H <bmc_ip> -U <user> chassis status
 一句话总结：
 
 > 服务器直连交换机的 Ascend 910B 千卡推理集群，核心不是“有多少张卡”，而是把每个推理副本稳定地绑定到明确的物理服务器、NPU、网卡、交换机端口和模型缓存路径上；这样故障发生时，才能从 p99 延迟一路追到具体光模块、端口、网卡或某个慢 rank。
+
+---
+
+## 昇腾 910B 算力运维知识
+
+本章补充面向运维和平台同学的 Ascend 910B 算力运维知识。重点不是模型算法，而是：
+
+```text
+卡是否健康
+驱动 / 固件 / CANN 是否一致
+HCCL 通信是否稳定
+推理进程是否正确使用 NPU
+温度、功耗、HBM、错误码是否异常
+故障时如何从业务现象定位到服务器、NPU、网卡和交换机端口
+```
+
+### 1. 运维对象分层
+
+昇腾 910B 集群运维可以按 7 层看：
+
+| 层级 | 运维对象 | 关注点 |
+|---|---|---|
+| 机房基础设施 | 电力、制冷、机柜、线缆、光模块 | 温度、电源、链路稳定性 |
+| 服务器硬件 | CPU、内存、本地 NVMe、BMC、PCIe / 板卡 | 硬件告警、重启、盘满、PCIe 错误 |
+| Ascend 910B | NPU、HBM、温度、功耗、健康状态 | NPU error、reset、降频、HBM 使用 |
+| 驱动和固件 | Ascend driver、firmware | 版本一致性、加载状态、内核日志 |
+| CANN / 运行时 | Ascend Toolkit、runtime、算子库 | 版本匹配、环境变量、算子报错 |
+| 通信层 | HCCL、RankTable、算力网卡、RoCE | rank timeout、链路抖动、PFC / ECN |
+| 服务层 | 推理 worker、模型权重、路由、监控 | 首 token、decode p99、进程状态、日志 |
+
+一句话：
+
+> 昇腾 910B 运维不是只看 `npu-smi`，而是要把 NPU、驱动、CANN、HCCL、网卡、交换机、模型服务串成一条证据链。
+
+### 2. 日常巡检清单
+
+建议每天或每班次巡检：
+
+| 巡检项 | 检查内容 | 异常风险 |
+|---|---|---|
+| NPU 可见性 | 服务器是否能识别全部 8 张 Ascend 910B | 卡丢失、驱动异常 |
+| NPU 健康状态 | health、error、reset、告警 | 卡故障、固件异常 |
+| HBM 使用 | 是否异常打满或泄漏 | 推理失败、OOM |
+| 温度和功耗 | 是否接近阈值或波动异常 | 降频、重启、硬件损伤 |
+| 驱动 / 固件 / CANN | 版本是否和基线一致 | 兼容性问题、算子错误 |
+| HCCL 通信 | 是否 timeout、rank error | 副本不可用、p99 升高 |
+| 算力网卡 | CRC、FEC、PFC、ECN、drop | 通信抖动、慢 rank |
+| 本地 NVMe | 模型缓存是否完整、空间是否足够 | 模型加载失败、冷启动慢 |
+| 推理进程 | worker 是否存活、是否卡死 | 副本失效 |
+| 日志和监控 | 指标是否连续、日志是否异常增长 | 故障不可观测 |
+
+### 3. 常用命令
+
+> 不同 CANN / driver / npu-smi 版本的参数可能略有差异，以下命令作为运维方向模板。遇到参数不一致时，先执行 `npu-smi -h` 查看本机支持项。
+
+#### 3.1 查看 NPU 基础状态
+
+```bash
+# 查看所有 Ascend NPU 基础信息
+npu-smi info
+
+# 持续刷新查看状态，适合观察推理运行中利用率、HBM、温度变化
+npu-smi info -l
+
+# 查看 npu-smi 支持的参数
+npu-smi -h
+```
+
+重点关注：
+
+```text
+每台服务器是否识别到预期数量的 NPU，例如 8 张。
+NPU health 是否正常。
+HBM 使用是否符合模型预期。
+温度是否异常升高。
+功耗是否异常波动。
+是否出现 error / reset / alarm。
+```
+
+#### 3.2 查看驱动、固件和 CANN 版本
+
+常见检查方式：
+
+```bash
+# 查看 Ascend 相关安装目录
+ls -l /usr/local/Ascend || true
+
+# 查看 toolkit 版本文件，具体路径以实际安装为准
+find /usr/local/Ascend -maxdepth 4 -name "version.info" -o -name "*.info"
+
+# 查看环境变量
+env | sort | rg "ASCEND|CANN|HCCL|LD_LIBRARY_PATH|PATH"
+
+# 查看内核中 Ascend 相关日志
+dmesg -T | rg -i "ascend|npu|davinci|hisi|error|reset|pcie"
+journalctl -k --since "1 hour ago" | rg -i "ascend|npu|error|reset|pcie"
+```
+
+版本管理原则：
+
+```text
+同一推理副本内，驱动、固件、CANN、推理框架版本必须一致。
+同一资源池内，建议按批次灰度升级，不要混用多个未知版本。
+升级前记录 npu-smi、driver、firmware、CANN、推理框架版本基线。
+升级后必须跑单机推理、HCCL 通信、模型加载和业务探测。
+```
+
+#### 3.3 查看 NPU 进程和资源占用
+
+```bash
+# 查看 NPU 使用情况
+npu-smi info
+
+# 查看推理进程
+ps -ef | rg "infer|mind|llm|worker|python" | rg -v rg
+
+# 查看进程 CPU / 内存 / I/O
+top
+pidstat -dru 1
+
+# 查看本地模型缓存
+du -sh /data/model-cache/* 2>/dev/null
+df -h
+```
+
+排查思路：
+
+```text
+NPU HBM 很高但没有推理进程：可能有残留进程或资源未释放。
+推理进程存在但 NPU util 很低：可能在等网络、等数据、等其他 rank。
+某个 worker 进程 CPU 打满：可能是前处理、tokenizer、日志或异常重试问题。
+本地 NVMe 空间不足：可能导致模型预热失败或启动失败。
+```
+
+#### 3.4 查看 HCCL 和 rank 相关日志
+
+日志路径会因部署方式、框架和环境变量不同而不同，常见来源包括：
+
+```text
+推理服务日志目录，例如 /var/log/llm/
+启动脚本输出日志
+用户目录或运行目录下的 Ascend / CANN 日志
+系统日志：dmesg、journalctl
+```
+
+命令示例：
+
+```bash
+# 搜索 HCCL / rank / timeout
+rg -n "HCCL|hccl|rank|timeout|connect|error|fail" /var/log/llm /tmp 2>/dev/null
+
+# 搜索 Ascend runtime / CANN 相关错误
+rg -n "ASCEND|Ascend|CANN|acl|runtime|E[0-9]{4}|error|failed" /var/log/llm /tmp 2>/dev/null
+
+# 查看最近内核日志
+journalctl -k --since "1 hour ago" | rg -i "ascend|npu|pcie|reset|error"
+```
+
+HCCL 常见排查方向：
+
+```text
+RankTable 中 rank_id、server_id、device_id、device_ip 是否正确。
+所有 rank 是否都启动。
+所有 rank 使用的 HCCL / CANN 版本是否一致。
+device_ip 是否属于算力网络，而不是管理网络。
+异常 rank 是否对应同一台服务器或同一个交换机端口。
+```
+
+### 4. 版本和变更管理
+
+昇腾 910B 集群最怕“版本不一致但表面能跑”。建议建立版本基线表：
+
+| 项目 | 示例记录 |
+|---|---|
+| OS 版本 | openEuler / EulerOS / 企业 Linux 版本 |
+| Kernel 版本 | `uname -r` |
+| Ascend driver | driver 版本 |
+| Firmware | 固件版本 |
+| CANN Toolkit | toolkit 版本 |
+| 推理框架 | MindIE / MindSpore Serving / 自研框架版本 |
+| HCCL 配置 | HCCL 参数、RankTable 生成逻辑 |
+| 模型版本 | 权重版本、Tokenizer、配置 |
+| 网卡驱动 / 固件 | 高速网卡驱动和固件版本 |
+
+基线采集命令示例：
+
+```bash
+hostname
+uname -a
+npu-smi info
+ls -l /usr/local/Ascend || true
+find /usr/local/Ascend -maxdepth 4 -name "version.info" -o -name "*.info"
+ethtool -i <compute_nic>
+```
+
+升级流程建议：
+
+```text
+1. 选择少量服务器作为灰度节点。
+2. 下线这些节点上的推理副本。
+3. 升级 driver / firmware / CANN / 推理框架。
+4. 重启必要服务或服务器。
+5. 执行 npu-smi 检查。
+6. 执行单卡推理测试。
+7. 执行多卡 HCCL 通信测试。
+8. 执行业务预热请求。
+9. 观察至少一段时间的错误率、p99、NPU 指标和 HCCL 日志。
+10. 再分批扩大升级范围。
+```
+
+回滚原则：
+
+```text
+必须保留上一版本安装包和配置。
+必须记录升级前版本基线。
+必须保留模型路由降权 / 摘除能力。
+不要在业务高峰期全量升级驱动、固件或 CANN。
+```
+
+### 5. Ascend 910B 健康检查脚本模板
+
+下面是一个可改造成巡检脚本的模板：
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+echo "=== host ==="
+hostname
+date
+uname -a
+
+echo "=== npu-smi ==="
+npu-smi info || true
+
+echo "=== ascend version files ==="
+find /usr/local/Ascend -maxdepth 4 -name "version.info" -o -name "*.info" 2>/dev/null || true
+
+echo "=== ascend env ==="
+env | sort | rg "ASCEND|CANN|HCCL|LD_LIBRARY_PATH|PATH" || true
+
+echo "=== kernel errors ==="
+journalctl -k --since "2 hours ago" | rg -i "ascend|npu|davinci|hisi|pcie|reset|error|fail" || true
+
+echo "=== model cache ==="
+df -h
+du -sh /data/model-cache/* 2>/dev/null || true
+
+echo "=== infer processes ==="
+ps -ef | rg "infer|mind|llm|worker|python" | rg -v rg || true
+```
+
+多节点批量执行：
+
+```bash
+# 示例：用 pdsh 批量执行
+pdsh -w ascend-node-[001-128] 'bash /opt/ops/check_ascend_910b.sh'
+
+# 示例：只检查一个副本的两台机器
+pdsh -w ascend-node-[001-002] 'npu-smi info'
+```
+
+### 6. 常见故障和处理方法
+
+#### 6.1 服务器识别不到某张 NPU
+
+现象：
+
+```text
+npu-smi info 中少一张卡。
+推理副本启动失败。
+日志中出现 device not found 或 runtime 初始化失败。
+```
+
+排查：
+
+```bash
+npu-smi info
+dmesg -T | rg -i "ascend|npu|pcie|reset|error"
+journalctl -k --since "1 hour ago" | rg -i "ascend|npu|pcie|error"
+```
+
+处理：
+
+```text
+先从模型路由摘除该服务器。
+确认是否近期升级过 driver / firmware / CANN。
+检查 BMC 硬件告警、PCIe 相关日志。
+必要时重启服务器或联系硬件维护。
+修复后必须跑 npu-smi、单卡推理、多卡通信测试再上线。
+```
+
+#### 6.2 HBM 使用异常或疑似泄漏
+
+现象：
+
+```text
+推理进程退出后 HBM 仍然很高。
+新副本启动时报显存不足。
+tokens/sec 下降或请求失败。
+```
+
+排查：
+
+```bash
+npu-smi info
+ps -ef | rg "infer|mind|llm|worker|python" | rg -v rg
+```
+
+处理：
+
+```text
+确认是否有残留推理进程。
+按业务流程优雅停止 worker。
+必要时重启相关服务或服务器。
+排查模型加载失败后是否没有释放资源。
+将该问题纳入发布回归测试。
+```
+
+#### 6.3 NPU 温度高或降频
+
+现象：
+
+```text
+温度持续高位。
+功耗或频率异常波动。
+tokens/sec 下降。
+同机柜多台服务器同时异常。
+```
+
+排查：
+
+```bash
+npu-smi info
+ipmitool -I lanplus -H <bmc_ip> -U <user> sensor
+```
+
+处理：
+
+```text
+检查机柜进出风、风扇、电源和空调。
+确认是否局部热点或盲板缺失。
+降低该机柜调度密度或临时摘除异常服务器。
+温度恢复后再做压力测试。
+```
+
+#### 6.4 HCCL timeout
+
+现象：
+
+```text
+推理副本启动失败或运行中报 HCCL timeout。
+某个 rank 日志落后。
+首 token / decode p99 突然升高。
+```
+
+排查：
+
+```bash
+rg -n "HCCL|hccl|rank|timeout|connect|error" /var/log/llm/replica-* 2>/dev/null
+npu-smi info
+ethtool -S <compute_nic> | rg -i "pause|pfc|ecn|drop|discard|err|crc|fec"
+```
+
+交换机侧：
+
+```text
+show interface ethernet <port> counters errors
+show interface ethernet <port> counters pfc
+show interface ethernet <port> counters ecn
+show interface ethernet <port> buffer
+```
+
+处理：
+
+```text
+从 RankTable 找到异常 rank 对应服务器、device、device_ip。
+检查该服务器 NPU、compute NIC、交换机端口。
+如果 PFC/ECN/CRC/FEC 异常增长，优先处理网络链路。
+如果只在某个模型或版本出现，检查 RankTable、HCCL 参数和模型切分。
+```
+
+#### 6.5 模型加载慢
+
+现象：
+
+```text
+副本启动慢。
+模型预热耗时明显增加。
+存储网卡吞吐打满。
+本地 NVMe 空间不足。
+```
+
+排查：
+
+```bash
+rg -n "download|model|weight|load|timeout|error" /var/log/model-sync /var/log/llm 2>/dev/null
+df -h
+du -sh /data/model-cache/* 2>/dev/null
+iostat -xz 1
+ip -s link show <storage_nic>
+ethtool -S <storage_nic> | rg -i "err|drop|discard|pause|timeout"
+```
+
+处理：
+
+```text
+分批预热模型，不要全量并发拉取。
+清理过期模型缓存。
+热点模型按 rack / 拓扑域做本地缓存。
+检查对象存储网关或共享文件系统元数据压力。
+```
+
+### 7. 监控指标建议
+
+| 指标类别 | 指标 | 用途 |
+|---|---|---|
+| NPU 健康 | health、error、reset、alarm | 判断卡是否可用 |
+| NPU 资源 | util、HBM 使用、功耗、温度 | 判断算力是否有效利用 |
+| 推理服务 | 首 token、decode p99、tokens/sec、错误率 | 判断业务体验 |
+| HCCL | timeout、rank error、初始化耗时 | 判断分布式通信是否健康 |
+| 主机 | CPU、内存、本地 NVMe、iowait | 判断是否主机瓶颈 |
+| 算力网络 | CRC、FEC、PFC、ECN、drop、buffer | 判断是否网络传导 |
+| 存储面 | 模型预热耗时、读吞吐、元数据延迟 | 判断是否存储瓶颈 |
+| 管理面 | agent 心跳、SSH 可达、日志采集延迟 | 判断状态是否可信 |
+
+告警建议：
+
+```text
+NPU error / reset：立即告警。
+NPU 温度持续高位：告警并关联机柜。
+HBM 使用异常高且无对应进程：告警。
+HCCL timeout：立即告警并自动关联 RankTable。
+PFC / CRC / FEC 持续增长：告警并关联交换机端口。
+模型预热耗时超过基线：告警并关联存储面。
+推理 p99 突然升高：联动检查 HCCL、NPU、存储和网络。
+```
+
+### 8. 运维台账
+
+千卡集群必须维护准确台账，否则故障只能停留在“某个 rank 慢”。
+
+建议台账字段：
+
+```text
+server_id
+rack
+管理 IP
+BMC IP
+NPU 编号
+device_id
+compute_nic
+compute_nic IP
+storage_nic
+switch_name
+switch_port
+光模块 SN
+线缆 SN
+driver 版本
+firmware 版本
+CANN 版本
+当前承载模型 / 副本
+```
+
+排障映射链：
+
+```text
+业务请求 p99 高
+=> replica_id
+=> rank_id
+=> server_id
+=> device_id
+=> compute_nic
+=> switch_port
+=> 光模块 / 光纤 / 交换机队列
+```
+
+### 9. 上线前验收
+
+新服务器或维修后服务器上线前，建议至少通过：
+
+```text
+1. BMC 无硬件告警。
+2. npu-smi 能识别全部 NPU。
+3. driver / firmware / CANN 版本符合基线。
+4. 单卡推理测试通过。
+5. 单机多卡推理测试通过。
+6. 跨机 HCCL 通信测试通过。
+7. 模型预热到本地 NVMe 成功。
+8. 算力网卡无 CRC / FEC / PFC 异常增长。
+9. 存储网卡无 drop / error 异常增长。
+10. 监控、日志、告警全部接入。
+```
+
+上线原则：
+
+> 没有通过 NPU、HCCL、模型加载、网络计数器和监控接入验收的服务器，不应进入千卡推理资源池。
 
 ---
 
